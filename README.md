@@ -198,6 +198,44 @@ range shown, which follows your zoom. Colours always mean the component
 **File ▸ Load data…** opens any earlier capture CSV in the Plot Results window, to look
 at old data. It starts in today's session folder, or the folder you used last.
 
+### Strike tests: how the treadmill rings
+
+Hit the deck once with a mallet during a log (wait a second after pressing Log,
+and say where you hit in the notes). Then **File ▸ Strike analysis…** opens a
+window on the session, or run it by itself:
+```
+uv run modes_gui.py "<session folder>"
+```
+Opened without a folder, it goes back to the session it was last closed on
+(remembered in `.modes_gui_state.json` beside the code, which git ignores).
+Only the captures with a strike in them are listed (tares and standing loads are
+left out; untick **only hits** to see them), and the resting load on
+each corner is shown under the list. Pick a capture and tick what to plot. The four vertical forces are shown as
+what the whole treadmill is doing: **Fz total** (all four corners together: the
+deck bouncing, and what a gait analysis reads), **pitch** (front pair minus back
+pair), **roll** (left minus right) and **twist** (one diagonal minus the other).
+The exact sums are written at the bottom left of the window and on every page
+of the report (pitch = FL + FR − BR − BL, and so on).
+You can also plot any pair of corners, any single channel, or your own sum or
+difference of two cells. The plots are the signals against time, a sliding-window
+spectrum (spectrogram) on the same time axis, and their spectrum over the
+shaded time window. Drag across either of the top two plots to move the window. A filter (low-pass,
+high-pass, band-pass, notch) can be put in front of everything. The table
+underneath lists each resonance in the window: its frequency, how much of it
+is bounce, pitch, roll and twist, and its damping.
+
+**Save figure…** writes the plots as EPS, PDF or SVG (vector) or PNG.
+**Strike report (PDF)…** finds every hit in the session and writes one PDF,
+named after the session folder (`<session>_strike_report.pdf`): a
+summary of the resonances that show up in more than one hit, then a page per
+hit. The same report from the terminal:
+```
+uv run deck_modes.py "<session folder>"
+```
+
+Everything here turns each channel into newtons with its cell's calibration
+first, so forces add as forces, not volts.
+
 **Made a mistake?** Open **Details**, click the capture in the **Session** list
 and click **Remove selected**. Clicking a capture in the list also shows its
 plots and its average centre of pressure.
@@ -277,8 +315,10 @@ These are kept, but the calibration fit ignores them.
 
 # Load-cell layout and wiring
 
-`forceplate_layout.json` (in this folder) says where each load cell is and how
-to turn its volts into newtons. Edit it in any text editor.
+`forceplate_layout.json` (in this folder) says where each load cell sits and which
+serial we expect on each amplifier input. Edit it in any text editor. The numbers
+that turn volts into newtons come from the calibration sheets, typed into
+`loadcell_cal.py` (see **Scale** below).
 
 **Plug-in order.** Load cell *N* goes into the amplifier's load-cell input *N*
 (the four M12 connectors on the Michigan Scientific SGA12), so its signals come
@@ -297,18 +337,35 @@ out on wire bundle *N* as NX, NY, NZ:
 left edge** and `y_m` how far **back from the front edge**, in metres, measured
 from the deck's front-left corner. The deck size there is the app's default.
 
-**Scale.** `newtons_per_volt` is per axis and comes from each load cell's
-calibration sheet. The amplifier has gain 201 and 10 V excitation, so if a sheet
-says *S* mV/V at a rated load of *F* newtons:
+**Scale.** Each cell's Michigan Scientific serial (`TR3D-A-3K 401` …) picks its
+numbers from `SHEETS` in `loadcell_cal.py`, copied from that serial's calibration
+sheet. The amplifier has gain 201 and 10 V excitation, so if a sheet says
+"1 mV/V = *L* N":
 ```
-newtons_per_volt = F / (2.01 × S)
+newtons_per_volt = L / 2.01
 ```
-A load pressing down should read as positive Z; if it reads negative, make that
-cell's Z number negative. The file now has **1660 N/V on every axis**, from what
-we believe the cells are: 4 mV/V, rated 3000 lbf (13345 N), so about 8 V out at
-the rated load, inside the DAQ's ±10 V. These are still unchecked against the
-sheets (X and Y may be rated differently from Z), so they count as **placeholders**, and
-the line under the **Log** button says "placeholder scale" until you set `"scale_is_placeholder": false`.
+The sheet's crosstalk (rows: what the X, Y, Z channels read; columns: the load
+applied on X, Y, Z) is undone for each cell. A load pressing down should read
+as positive Z; if an axis reads backwards, add `"flip": ["Z"]` to that cell. To
+override a sheet for one cell, give it its own `newtons_per_volt` and/or `crosstalk`.
+
+**Which cell is on which input.** Each cell has its own small output at no load
+(its "unbalance", on its sheet). Unloaded, a cell's X and Y read close to it, so
+the resting volts show which serial is on which input:
+```
+uv run loadcell_cal.py "<session folder>"
+```
+prints the resting X/Y per input against each sheet, the serials it identifies,
+the newtons per volt in use and, for loads with an entered force, the measured
+total against it. A corner belongs to its serial, so if cables were swapped
+(as on Nov 4, 2026, inputs 3 and 4), old captures open with the wiring their
+resting volts show. `uv run --extra sheets loadcell_cal.py --check-sheets` re-reads
+the PDFs and confirms `SHEETS` matches them.
+
+Each new session saves a copy of the layout, with every number filled in, in its
+`session.json`, and is always read with that copy. The captures themselves are
+always raw volts. **If you move a cable or swap a load cell**, change `serial` for
+that input before recording.
 
 # Wiring reference
 
@@ -391,8 +448,11 @@ samples, scans). The FPGA bitstream in `mcc1608g/firmware/` is the one MCC
 ships in libuldaq. The device loses it at power-off, so the driver uploads
 it on the first connection after power-up, which takes about a second.
 
-The calibration app is `forceplate_gui.py`, and the session files and fit are in
-`forceplate.py`. In single-ended mode CHnH is AI channel n and CHnL is n + 8, so one
+The calibration app is `forceplate_gui.py`. Session files, units and spectra are in
+`forceplate.py`. Everything that turns volts into newtons is in `loadcell_cal.py`:
+the calibration sheets, which serial is on which input, the layout, per-cell forces
+with crosstalk correction, and the 6×12 deck fit (`uv run loadcell_cal.py <session> --fit`,
+the same as `uv run forceplate.py <session>`). In single-ended mode CHnH is AI channel n and CHnL is n + 8, so one
 scan of channels 0–11 returns 1X 1Y 1Z 2X … 4Z in order.
 
 ## Testing

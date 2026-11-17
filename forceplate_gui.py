@@ -68,6 +68,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 import forceplate as fp
+import loadcell_cal as lc
+import modes_gui
 from mcc1608g import USB1608G, AiMode, AiRange, DaqError
 
 # Deck size and load-cell positions: forceplate_layout.json (or --length/--width,
@@ -513,10 +515,10 @@ class App(tk.Tk):
     def __init__(self, daq: USB1608G | None, daq_error: str = "",
                  session_dir: Path | None = None,
                  deck_length: float | None = None, deck_width: float | None = None,
-                 layout: fp.Layout | None = None):
+                 layout: lc.Layout | None = None):
         super().__init__()
         self.title("Force-plate calibration")
-        self.layout = layout or fp.load_layout()
+        self.layout = layout or lc.load_layout()
         self.deck_length = deck_length or self.layout.deck_length_m   # metres, front to back (y)
         self.deck_width = deck_width or self.layout.deck_width_m      # metres, side to side (x)
         self.settings = load_settings()
@@ -544,6 +546,7 @@ class App(tk.Tk):
         self._live_before_capture = False
         self._capture_seconds = fp.CAPTURE_SECONDS
         self.post_window: PostWindow | None = None
+        self.modes_window: modes_gui.ModesWindow | None = None
         self.post_data: tuple | None = None    # (data, rate, title, unit) of the last capture shown
         n_window = int(MONITOR_WINDOW_S * fp.SAMPLE_RATE)
         self.live_buffer = np.full((n_window, 12), np.nan)
@@ -580,6 +583,8 @@ class App(tk.Tk):
         file_menu.add_command(label="Load data...", command=self._load_data,
                               accelerator=f"{'Cmd' if mod == 'Command' else 'Ctrl'}+O")
         file_menu.add_command(label="Open data folder", command=self._open_data_folder)
+        file_menu.add_separator()
+        file_menu.add_command(label="Strike analysis...", command=self._open_modes)
         menubar.add_cascade(label="File", menu=file_menu)
         self.config(menu=menubar)
         self.bind_all(f"<{mod}-o>", lambda _e: self._load_data())
@@ -611,6 +616,17 @@ class App(tk.Tk):
         self._open_post_window().show(*shown)
         self.post_window.lift()
         self._set_status(f"Viewing {path.parent.name}/{path.name} in the Plot Results window.")
+
+    def _open_modes(self):
+        """The strike analysis window (modes_gui.py), on this session or the last one viewed."""
+        if self.modes_window is not None:
+            self.modes_window.lift()
+            return
+        folder = self.session.folder if self.session else self.settings.get("last_load_dir")
+        if folder is None or not (Path(folder) / "session.json").exists():
+            folder = None
+        self.modes_window = modes_gui.ModesWindow(
+            self, self.layout, folder, on_close=lambda: setattr(self, "modes_window", None))
 
     # -- layout: everything visual on the left -------------------------------
     def _build_visuals(self):
@@ -946,7 +962,8 @@ class App(tk.Tk):
         for i, cell in enumerate("1234"):
             x, y = lay.positions[i]
             npv = lay.newtons_per_volt[3 * i:3 * i + 3]
-            lines.append(f"  cell {cell} ({lay.where[cell]}) on amplifier input {cell}: "
+            serial = f" {lay.serials[cell]}" if lay.serials.get(cell) else ""
+            lines.append(f"  cell {cell}{serial} ({lay.where[cell]}) on amplifier input {cell}: "
                          f"{x:g} m right, {y:g} m back; "
                          + ", ".join(f"{a} {v:g}" for a, v in zip("XYZ", npv)) + " N/V")
         if lay.placeholder:
@@ -1219,7 +1236,8 @@ class App(tk.Tk):
             if self.session is None:
                 folder = self.data_dir / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 info = {"product": self.daq.product_name, "serial": self.daq.serial}
-                self.session = fp.Session.create(folder, self.deck_length, self.deck_width, info)
+                self.session = fp.Session.create(folder, self.deck_length, self.deck_width, info,
+                                                layout=self.layout)
             entry = self.session.add_trial(volts, rate, kind, **fields)
         except Exception as e:
             self._save_failed(e, volts, rate)
@@ -1314,7 +1332,7 @@ class App(tk.Tk):
         thins each line to about that many samples, for a quick live redraw.
         """
         loop = self.loopback.get()
-        data = volts if loop else fp.cell_forces(volts, zero, self.layout)
+        data = volts if loop else lc.cell_forces(volts, zero, self.layout)
         t = t0 + np.arange(len(data)) / rate
         step = max(1, len(data) // points) if points else 1
         for i, line in enumerate(self.lines):
@@ -1344,8 +1362,8 @@ class App(tk.Tk):
         elif zero is None:
             text = f"{what}: tare first (no load, Tare) to see the centre of pressure."
         else:
-            forces = fp.cell_forces(mean_v, zero, self.layout)
-            cop = fp.cop_from_cells(forces, self.layout)
+            forces = lc.cell_forces(mean_v, zero, self.layout)
+            cop = lc.cop_from_cells(forces, self.layout)
             if cop is None:
                 text = f"{what}: almost no load on the deck."
             else:
@@ -1386,7 +1404,7 @@ class App(tk.Tk):
         if t["kind"] == "loopback":
             data, unit = volts, "volts"
         else:
-            data = fp.cell_forces(volts, zero, self.layout)
+            data = lc.cell_forces(volts, zero, self.layout)
             unit = "newtons" + ("" if zero is not None else " (NOT TARED)")
             if self.layout.placeholder:
                 unit += ", placeholder scale"
@@ -1486,11 +1504,11 @@ class App(tk.Tk):
             return
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            ids, signals, known = fp.gather(self.session)
+            ids, signals, known = lc.gather(self.session)
             if ids:
-                fit = fp.fit_calibration(ids, signals, known)
-                fp.report(fit)
-                paths = fp.save_fit(fit, self.session)
+                fit = lc.fit_calibration(ids, signals, known)
+                lc.report(fit)
+                paths = lc.save_fit(fit, self.session)
                 print(f"\nSaved {paths[0]} and {paths[1]}")
             else:
                 print("No usable load trials (each needs a tare captured before it).")
@@ -1596,7 +1614,7 @@ class App(tk.Tk):
         self.destroy()
 
 
-def load_capture(path: Path, layout: fp.Layout) -> tuple[np.ndarray, float, str, str]:
+def load_capture(path: Path, layout: lc.Layout) -> tuple[np.ndarray, float, str, str]:
     """
     Read a capture CSV for viewing: (data, rate, title, unit). If its folder has
     a session.json, the trial's notes go in the title and a load is shown in
@@ -1620,10 +1638,13 @@ def load_capture(path: Path, layout: fp.Layout) -> tuple[np.ndarray, float, str,
                 title += f"   ({entry['notes']})"
     if entry is not None and entry.get("kind") == "loopback":
         return volts, rate, title, "volts"
+    layout, note = lc.calibration_for_session(path.parent, layout)
+    if note:
+        title += f"   [{note}]"
     unit = "newtons" + ("" if zero is not None else " (NOT TARED)")
     if layout.placeholder:
         unit += ", placeholder scale"
-    return fp.cell_forces(volts, zero, layout), rate, title, unit
+    return lc.cell_forces(volts, zero, layout), rate, title, unit
 
 
 def load_settings() -> dict:
